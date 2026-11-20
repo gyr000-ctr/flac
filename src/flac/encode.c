@@ -117,6 +117,10 @@ typedef struct {
 	FILE *fin;
 	FLAC__StreamMetadata *seek_table_template;
 	double progress, compression_ratio;
+	/* combined --keep-foreign-metadata --ignore-chunk-sizes WAVE path: the
+	 * size-corrected temporary copy the foreign metadata is read from, and the
+	 * path it lives at (unlinked in destroy); NULL when not in use */
+	char *corrected_wave_path;
 } EncoderSession;
 
 const int FLAC_ENCODE__DEFAULT_PADDING = 8192;
@@ -857,12 +861,339 @@ static FLAC__bool get_sample_info_flac(EncoderSession *e, FLAC__bool do_check_md
 }
 
 /*
+ * Starting at 'start', verify that the remaining bytes form a chain of
+ * well-formed RIFF chunks (8-byte header + padded body) that lands exactly on
+ * EOF.  Used to decide whether bytes following the declared 'data' payload are
+ * genuine trailing chunks or merely audio that resembles a chunk header.
+ * The caller closes the file immediately afterwards, so its file offset is
+ * not preserved.
+ */
+static FLAC__bool riff_wave_chain_reaches_eof_(FILE *f, FLAC__off_t start, FLAC__off_t file_size)
+{
+	FLAC__off_t pos = start;
+	if(start > file_size)
+		return false;
+	while(pos < file_size) {
+		FLAC__byte hdr[8];
+		FLAC__uint64 csize, padded;
+		if(file_size - pos < 8)
+			return false;
+		if(fseeko(f, pos, SEEK_SET) < 0 || fread(hdr, 1, 8, f) != 8)
+			return false;
+		csize = (FLAC__uint64)hdr[4] | ((FLAC__uint64)hdr[5] << 8) | ((FLAC__uint64)hdr[6] << 16) | ((FLAC__uint64)hdr[7] << 24);
+		padded = csize + (csize & 1);
+		if(padded > (FLAC__uint64)(file_size - pos - 8))
+			return false; /* declared body overruns the file */
+		pos += 8 + (FLAC__off_t)padded;
+	}
+	return pos == file_size;
+}
+
+/*
+ * Reset the foreign-metadata object to its freshly-constructed state without
+ * freeing the object itself: the caller (main.c) keeps the outer pointer, so a
+ * delete()+new() would leave it dangling.  Used to discard the lenient scan's
+ * provisional block list before the strict reader rebuilds it.
+ */
+static void foreign_metadata_reset(foreign_metadata_t *fm)
+{
+	if(fm->blocks) {
+		free(fm->blocks);
+		fm->blocks = 0;
+	}
+	fm->num_blocks = 0;
+	fm->format_block = 0;
+	fm->audio_block = 0;
+	fm->is_rf64 = false;
+	fm->is_wavefmtex = false;
+	fm->is_aifc = false;
+	fm->is_sowt = false;
+	fm->aifc_comm_length = 0;
+	fm->ssnd_offset_size = 0;
+}
+
+/*
+ * Lenient RIFF WAVE foreign-metadata scanner.
+ *
+ * Used when both --keep-foreign-metadata and --ignore-chunk-sizes are in
+ * effect on a plain RIFF WAVE.  The strict scanner in foreign_metadata.c
+ * trusts the on-disk chunk sizes and refuses to keep metadata from files whose
+ * chunk chain is broken.  Here we instead walk the chunks by their declared
+ * sizes but treat the physical end of file as the authoritative boundary, so a
+ * wrong RIFF/data size no longer aborts the scan.  The actual ('data') length
+ * discovered here is handed back via *data_bytes so the chunk sizes can be
+ * recomputed from the decoded audio length.
+ *
+ * Return codes mirror the encoder's contract:
+ *   0 success
+ *   1 the chunk layout itself is malformed (bad header, missing chunks, ...)
+ *   2 the audio data is truncated relative to its declared chunk size
+ */
+static int foreign_metadata_scan_wave_lenient(foreign_metadata_t *fm, const char *filename, FLAC__uint64 *data_bytes, FLAC__off_t *data_header_offset_out, const char **error)
+{
+	FILE *f;
+	FLAC__byte header[12];
+	FLAC__off_t file_size, next_offset, data_header_offset = -1, data_body_offset = -1, chunk_after_data_offset = -1;
+	FLAC__uint64 declared_data_size = 0;
+	FLAC__bool got_fmt = false, got_data = false;
+
+	FLAC__ASSERT(fm->type == FOREIGN_BLOCK_TYPE__RIFF);
+	if(data_header_offset_out)
+		*data_header_offset_out = -1;
+
+	if(0 == (f = flac_fopen(filename, "rb"))) {
+		if(error) *error = "can't open WAVE file for reading";
+		return 1;
+	}
+	if(fseeko(f, 0, SEEK_END) < 0 || (file_size = ftello(f)) < 0 || fseeko(f, 0, SEEK_SET) < 0) {
+		if(error) *error = "seek error while scanning WAVE file";
+		fclose(f);
+		return 1;
+	}
+	if(file_size < 12 || fread(header, 1, 12, f) < 12 || memcmp(header, "RIFF", 4) || memcmp(header+8, "WAVE", 4)) {
+		if(error) *error = "unsupported RIFF layout";
+		fclose(f);
+		return 1;
+	}
+
+	/* block 0: the 12-byte RIFF master chunk; its size field is distrusted */
+	{
+		foreign_block_t *fb = safe_realloc_nofree_muladd2_(fm->blocks, sizeof(foreign_block_t), fm->num_blocks, 1);
+		if(0 == fb) {
+			if(error) *error = "out of memory";
+			fclose(f);
+			return 1;
+		}
+		fm->blocks = fb;
+		fm->blocks[fm->num_blocks].offset = 0;
+		fm->blocks[fm->num_blocks].size = 12;
+		fm->num_blocks++;
+	}
+
+	while(!feof(f)) {
+		FLAC__byte buf[8];
+		FLAC__off_t chunk_offset;
+		FLAC__uint64 chunk_size, padded_size;
+		size_t read;
+
+		if((chunk_offset = ftello(f)) < 0) {
+			if(error) *error = "ftello() error while scanning WAVE file";
+			fclose(f);
+			return 1;
+		}
+		read = fread(buf, 1, 8, f);
+		if(read == 0 && feof(f))
+			break;
+		if(read < 8) {
+			/* a partial chunk header past the last complete chunk is a layout error */
+			if(error) *error = "invalid WAVE file: truncated chunk header";
+			fclose(f);
+			return 1;
+		}
+
+		chunk_size = (FLAC__uint64)buf[4] | ((FLAC__uint64)buf[5] << 8) | ((FLAC__uint64)buf[6] << 16) | ((FLAC__uint64)buf[7] << 24);
+		padded_size = chunk_size + (chunk_size & 1);
+
+		/* the first chunk seen after 'data' marks the true end of the audio payload */
+		if(got_data && chunk_after_data_offset < 0)
+			chunk_after_data_offset = chunk_offset;
+
+		if(!memcmp(buf, "fmt ", 4)) {
+			if(got_fmt) {
+				if(error) *error = "invalid WAVE file: multiple \"fmt \" chunks";
+				fclose(f);
+				return 1;
+			}
+			if(got_data) {
+				if(error) *error = "invalid WAVE file: \"data\" chunk before \"fmt \" chunk";
+				fclose(f);
+				return 1;
+			}
+			got_fmt = true;
+			fm->format_block = fm->num_blocks;
+		}
+		else if(!memcmp(buf, "data", 4)) {
+			if(got_data) {
+				if(error) *error = "invalid WAVE file: multiple \"data\" chunks";
+				fclose(f);
+				return 1;
+			}
+			if(!got_fmt) {
+				if(error) *error = "invalid WAVE file: \"data\" chunk before \"fmt \" chunk";
+				fclose(f);
+				return 1;
+			}
+			got_data = true;
+			fm->audio_block = fm->num_blocks;
+			data_header_offset = chunk_offset;
+			data_body_offset = chunk_offset + 8;
+			declared_data_size = chunk_size;
+		}
+
+		/* the 'data' chunk stores only its 8-byte header; the audio itself is
+		 * recreated from the FLAC stream on decode.  Every other chunk is kept whole. */
+		{
+			FLAC__uint32 store_size;
+			foreign_block_t *fb;
+			if(got_data && !memcmp(buf, "data", 4))
+				store_size = 8;
+			else {
+				if(padded_size >= (1u << FLAC__STREAM_METADATA_LENGTH_LEN) - FLAC__STREAM_METADATA_APPLICATION_ID_LEN/8) {
+					if(error) *error = "found foreign metadata chunk is too large (max is 16MiB per chunk)";
+					fclose(f);
+					return 1;
+				}
+				store_size = (FLAC__uint32)(8 + padded_size);
+			}
+			fb = safe_realloc_nofree_muladd2_(fm->blocks, sizeof(foreign_block_t), fm->num_blocks, 1);
+			if(0 == fb) {
+				if(error) *error = "out of memory";
+				fclose(f);
+				return 1;
+			}
+			fm->blocks = fb;
+			fm->blocks[fm->num_blocks].offset = chunk_offset;
+			fm->blocks[fm->num_blocks].size = store_size;
+			fm->num_blocks++;
+		}
+
+		/* advance by the declared (padded) size, clamped to the physical end of file */
+		next_offset = chunk_offset + 8 + (FLAC__off_t)padded_size;
+		if(next_offset > file_size)
+			next_offset = file_size;
+		if(fseeko(f, next_offset, SEEK_SET) < 0) {
+			if(error) *error = "seek error while scanning WAVE file";
+			fclose(f);
+			return 1;
+		}
+	}
+
+	if(!got_fmt) {
+		if(error) *error = "invalid WAVE file: missing \"fmt \" chunk";
+		fclose(f);
+		return 1;
+	}
+	if(!got_data) {
+		if(error) *error = "invalid WAVE file: missing \"data\" chunk";
+		fclose(f);
+		return 1;
+	}
+
+	/* The first 8 bytes after a zero/short declared 'data' size might just be
+	 * audio samples that happen to look like a chunk header.  Only treat the
+	 * candidate boundary as a real chunk chain if it walks cleanly to EOF;
+	 * otherwise the audio payload runs to the end of the file. */
+	if(chunk_after_data_offset >= 0 && !riff_wave_chain_reaches_eof_(f, chunk_after_data_offset, file_size)) {
+		chunk_after_data_offset = -1;
+		/* discard the spurious "trailing chunk" blocks the main loop appended;
+		 * they are rebuilt correctly from the corrected copy in phase 2 */
+		fm->num_blocks = (size_t)fm->audio_block + 1;
+	}
+
+	/* authoritative audio length: the physical bytes between the data header and
+	 * either the next chunk header or EOF, regardless of the declared size */
+	{
+		FLAC__off_t audio_end = (chunk_after_data_offset >= 0) ? chunk_after_data_offset : file_size;
+		FLAC__uint64 actual_data_size = (FLAC__uint64)(audio_end - data_body_offset);
+		*data_bytes = actual_data_size;
+		if(data_header_offset_out)
+			*data_header_offset_out = data_header_offset;
+		fclose(f);
+		/* truncation: the file ends (or another chunk starts) before the
+		 * declared audio payload is complete */
+		if(actual_data_size < declared_data_size) {
+			if(error) *error = "invalid WAVE file: 'data' chunk is truncated";
+			return 2;
+		}
+	}
+
+	return 0;
+}
+
+/*
+ * In combined --keep-foreign-metadata --ignore-chunk-sizes mode the foreign
+ * metadata blocks are copied verbatim from the WAVE file into the FLAC, and on
+ * decode the RIFF/data sizes are recomputed from the decoded audio length.  To
+ * keep the byte-for-byte foreign-metadata verification (and the resulting
+ * output) consistent, build a private copy of the source WAVE whose two
+ * distrusted size fields already match what will be regenerated on decode:
+ *   - the 32-bit 'data' chunk size at offset data_header_offset+4
+ *   - the 32-bit RIFF size at offset 4 (file length minus 8)
+ * The original input file is never modified.  Only plain RIFF WAVE uses the
+ * 32-bit fields, so this is only called for FORMAT_WAVE.  'copypath' names the
+ * temporary file to create; it is placed next to the (writable) output rather
+ * than the possibly read-only input directory.
+ */
+static FLAC__bool foreign_metadata_make_corrected_wave_copy(const char *srcpath, const char *copypath, FLAC__off_t data_header_offset, FLAC__uint32 data_size, FLAC__uint32 riff_size, const char **error)
+{
+	FILE *fin = 0, *fout = 0;
+	FLAC__byte block[8192];
+	FLAC__byte le32[4];
+	size_t n;
+
+	if(0 == (fin = flac_fopen(srcpath, "rb"))) {
+		if(error) *error = "can't open WAVE file for reading";
+		return false;
+	}
+	if(0 == (fout = flac_fopen(copypath, "w+b"))) {
+		if(error) *error = "can't create temporary corrected WAVE copy";
+		fclose(fin);
+		return false;
+	}
+
+	/* byte-for-byte copy, overwriting the two size fields on the way out */
+	while((n = fread(block, 1, sizeof(block), fin)) > 0) {
+		if(fwrite(block, 1, n, fout) != n) {
+			if(error) *error = "write failed on temporary corrected WAVE copy";
+			goto fail;
+		}
+	}
+	if(ferror(fin)) {
+		if(error) *error = "read failed on WAVE file";
+		goto fail;
+	}
+
+	le32[0] = (FLAC__byte)(data_size & 0xff);
+	le32[1] = (FLAC__byte)((data_size >> 8) & 0xff);
+	le32[2] = (FLAC__byte)((data_size >> 16) & 0xff);
+	le32[3] = (FLAC__byte)((data_size >> 24) & 0xff);
+	if(fseeko(fout, data_header_offset + 4, SEEK_SET) < 0 || fwrite(le32, 1, 4, fout) != 4) {
+		if(error) *error = "failed fixing up 'data' chunk size";
+		goto fail;
+	}
+	le32[0] = (FLAC__byte)(riff_size & 0xff);
+	le32[1] = (FLAC__byte)((riff_size >> 8) & 0xff);
+	le32[2] = (FLAC__byte)((riff_size >> 16) & 0xff);
+	le32[3] = (FLAC__byte)((riff_size >> 24) & 0xff);
+	if(fseeko(fout, 4, SEEK_SET) < 0 || fwrite(le32, 1, 4, fout) != 4) {
+		if(error) *error = "failed fixing up RIFF size";
+		goto fail;
+	}
+
+	fclose(fin);
+	fclose(fout);
+	return true;
+
+fail:
+	fclose(fin);
+	fclose(fout);
+	return false;
+}
+
+/*
  * public routines
  */
 int flac__encode_file(FILE *infile, FLAC__off_t infilesize, const char *infilename, const char *outfilename, const FLAC__byte *lookahead, uint32_t lookahead_length, encode_options_t options)
 {
 	EncoderSession encoder_session;
 	size_t channel_map[FLAC__MAX_CHANNELS];
+	/* authoritative audio length found by the lenient RIFF scanner; 0 means
+	 * "not available, fall back to the declared chunk size" */
+	FLAC__uint64 lenient_data_bytes = 0;
+	FLAC__off_t lenient_data_header_offset = -1;
+	/* true while we are in the lenient combined WAVE path and still need to
+	 * build the corrected copy and read foreign metadata after format parsing */
+	FLAC__bool lenient_wave_pending = false;
 
 	if(!EncoderSession_construct(&encoder_session, options, infilesize, infile, infilename, outfilename, lookahead, lookahead_length))
 		return 1;
@@ -874,10 +1205,42 @@ int flac__encode_file(FILE *infile, FLAC__off_t infilesize, const char *infilena
 			channel_map[i] = i;
 	}
 
-	/* read foreign metadata if requested */
+	/* Phase 1: foreign metadata.
+	 * In the lenient combined WAVE path we only scan the layout here; the
+	 * corrected copy and the strict foreign-metadata read happen after format
+	 * parsing (we need the sample width to recompute the data size). */
 	if(EncoderSession_format_is_iff(&encoder_session) && options.format_options.iff.foreign_metadata) {
-		const char *error;
-		if(!(
+		const char *error = 0;
+		if(options.ignore_chunk_sizes && options.format == FORMAT_WAVE && 0 != strcmp(infilename, "-")) {
+			int scan_rc = foreign_metadata_scan_wave_lenient(options.format_options.iff.foreign_metadata, infilename, &lenient_data_bytes, &lenient_data_header_offset, &error);
+			if(scan_rc == 2) {
+				flac__utils_printf(stderr, 1, "%s: ERROR reading foreign metadata: %s\n", encoder_session.inbasefilename, error);
+				(void)EncoderSession_finish_error(&encoder_session);
+				return 2;
+			}
+			if(scan_rc == 1) {
+				if(options.relaxed_foreign_metadata_handling) {
+					flac__utils_printf(stderr, 1, "%s: WARNING reading foreign metadata: %s\n", encoder_session.inbasefilename, error);
+					if(encoder_session.treat_warnings_as_errors)
+						return EncoderSession_finish_error(&encoder_session);
+					/* keep the outer object (main.c owns and frees it) but empty it
+					 * so no foreign metadata is written for this file */
+					foreign_metadata_reset(options.format_options.iff.foreign_metadata);
+					lenient_data_bytes = 0;
+				}
+				else {
+					flac__utils_printf(stderr, 1, "%s: ERROR reading foreign metadata: %s\n", encoder_session.inbasefilename, error);
+					return EncoderSession_finish_error(&encoder_session);
+				}
+			}
+			else {
+				/* scan OK: discard the lenient block list in place; it gets rebuilt
+				 * from the corrected copy by the strict reader in phase 2 below */
+				foreign_metadata_reset(options.format_options.iff.foreign_metadata);
+				lenient_wave_pending = true;
+			}
+		}
+		else if(!(
 			options.format == FORMAT_WAVE || options.format == FORMAT_RF64?
 				flac__foreign_metadata_read_from_wave(options.format_options.iff.foreign_metadata, infilename, &error) :
 			options.format == FORMAT_WAVE64?
@@ -929,6 +1292,76 @@ int flac__encode_file(FILE *infile, FLAC__off_t infilesize, const char *infilena
 			FLAC__ASSERT(0);
 			/* double protection */
 			return EncoderSession_finish_error(&encoder_session);
+	}
+
+	/* If the lenient scan succeeded the audio length is finalized in phase 2
+	 * below.  This only matters for the relaxed-handling fallback, where the
+	 * scan failed but encoding continues: use the declared length instead. */
+	if(!lenient_wave_pending && lenient_data_bytes != 0 && (options.format == FORMAT_WAVE || options.format == FORMAT_RF64)) {
+		encoder_session.fmt.iff.data_bytes = lenient_data_bytes;
+	}
+
+	/* Phase 2 (lenient combined WAVE path): now that the sample width is known,
+	 * build a size-corrected copy of the input and read foreign metadata from it.
+	 * The corrected RIFF/data size fields equal the values the decoder will
+	 * regenerate, so round-tripping is byte-for-byte. */
+	if(lenient_wave_pending) {
+		const char *error = 0;
+		char *copypath = 0;
+		/* round the audio payload down to a whole-sample boundary, mirroring the
+		 * "truncation removes padding byte" rule used elsewhere for IFF input */
+		FLAC__uint64 sample_bytes = (lenient_data_bytes / encoder_session.info.bytes_per_wide_sample) * encoder_session.info.bytes_per_wide_sample;
+		FLAC__uint32 data_size32;
+		FLAC__off_t original_size;
+		FILE *probe;
+
+		if(sample_bytes > 0xffffffffu) {
+			flac__utils_printf(stderr, 1, "%s: ERROR: audio data too large for a RIFF WAVE 'data' chunk\n", encoder_session.inbasefilename);
+			return EncoderSession_finish_error(&encoder_session);
+		}
+		if(0 == (probe = flac_fopen(infilename, "rb"))) {
+			flac__utils_printf(stderr, 1, "%s: ERROR: can't reopen WAVE file for size fix-up\n", encoder_session.inbasefilename);
+			return EncoderSession_finish_error(&encoder_session);
+		}
+		if(fseeko(probe, 0, SEEK_END) < 0 || (original_size = ftello(probe)) < 0) {
+			flac__utils_printf(stderr, 1, "%s: ERROR: seek error while fixing up WAVE sizes\n", encoder_session.inbasefilename);
+			fclose(probe);
+			return EncoderSession_finish_error(&encoder_session);
+		}
+		fclose(probe);
+
+		/* the corrected file differs from the original only in the audio payload
+		 * length (and the two size fields that describe it) */
+		if(sample_bytes < lenient_data_bytes)
+			original_size -= (FLAC__off_t)(lenient_data_bytes - sample_bytes);
+		/* RIFF size field is the file length minus the 8-byte master header */
+		data_size32 = (FLAC__uint32)sample_bytes;
+
+		/* place the temp copy next to the output, which is writable; the input
+		 * directory may be read-only.  keep-foreign-metadata forbids stdout, so
+		 * outfilename is always a real path here */
+		copypath = safe_malloc_(strlen(outfilename) + 16);
+		if(0 == copypath) {
+			flac__utils_printf(stderr, 1, "%s: ERROR: out of memory\n", encoder_session.inbasefilename);
+			return EncoderSession_finish_error(&encoder_session);
+		}
+		flac_snprintf(copypath, strlen(outfilename) + 16, "%s.fmfix", outfilename);
+
+		if(!foreign_metadata_make_corrected_wave_copy(infilename, copypath, lenient_data_header_offset, data_size32, (FLAC__uint32)(original_size - 8), &error)) {
+			flac__utils_printf(stderr, 1, "%s: ERROR reading foreign metadata: %s\n", encoder_session.inbasefilename, error);
+			free(copypath);
+			return EncoderSession_finish_error(&encoder_session);
+		}
+		if(!flac__foreign_metadata_read_from_wave(options.format_options.iff.foreign_metadata, copypath, &error)) {
+			flac__utils_printf(stderr, 1, "%s: ERROR reading foreign metadata: %s\n", encoder_session.inbasefilename, error);
+			flac_unlink(copypath);
+			free(copypath);
+			return EncoderSession_finish_error(&encoder_session);
+		}
+		/* hand ownership of the temp copy to the session; it is unlinked on destroy */
+		encoder_session.corrected_wave_path = copypath;
+		/* encode the whole-sample audio length rather than any pad byte */
+		encoder_session.fmt.iff.data_bytes = sample_bytes;
 	}
 
 	/* some more checks */
@@ -1049,11 +1482,13 @@ int flac__encode_file(FILE *infile, FLAC__off_t infilesize, const char *infilena
 					return EncoderSession_finish_error(&encoder_session);
 				}
 				encoder_session.fmt.iff.data_bytes -= skip * encoder_session.info.bytes_per_wide_sample;
-				if(options.ignore_chunk_sizes) {
+				if(options.ignore_chunk_sizes && !lenient_wave_pending) {
 					encoder_session.total_samples_to_encode = 0;
 					FLAC__ASSERT(0 == until);
 				}
 				else {
+					/* in the lenient combined WAVE path the scanner measured the
+					 * real audio length, so we know the sample count up front */
 					encoder_session.total_samples_to_encode = total_samples_in_input - skip;
 				}
 				break;
@@ -1473,6 +1908,7 @@ FLAC__bool EncoderSession_construct(EncoderSession *e, encode_options_t options,
 
 	e->fin = infile;
 	e->seek_table_template = 0;
+	e->corrected_wave_path = 0;
 
 	if(0 == (e->seek_table_template = FLAC__metadata_object_new(FLAC__METADATA_TYPE_SEEKTABLE))) {
 		flac__utils_printf(stderr, 1, "%s: ERROR allocating memory for seek table\n", e->inbasefilename);
@@ -1512,6 +1948,12 @@ void EncoderSession_destroy(EncoderSession *e)
 	if(0 != e->seek_table_template) {
 		FLAC__metadata_object_delete(e->seek_table_template);
 		e->seek_table_template = 0;
+	}
+
+	if(0 != e->corrected_wave_path) {
+		flac_unlink(e->corrected_wave_path);
+		free(e->corrected_wave_path);
+		e->corrected_wave_path = 0;
 	}
 }
 
@@ -1564,7 +2006,9 @@ int EncoderSession_finish_ok(EncoderSession *e, foreign_metadata_t *foreign_meta
 
 	if(ret == 0 && foreign_metadata) {
 		const char *error;
-		if(!flac__foreign_metadata_write_to_flac(foreign_metadata, e->infilename, e->outfilename, &error)) {
+		/* in the lenient combined WAVE path the corrected sizes live in the temp copy */
+		const char *fm_source = e->corrected_wave_path ? e->corrected_wave_path : e->infilename;
+		if(!flac__foreign_metadata_write_to_flac(foreign_metadata, fm_source, e->outfilename, &error)) {
 			flac__utils_printf(stderr, 1, "%s: ERROR: updating foreign metadata in FLAC file: %s\n", e->inbasefilename, error);
 			ret = 1;
 		}

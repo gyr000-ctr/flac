@@ -504,14 +504,13 @@ int do_it(void)
 			return usage_error("ERROR: --cuesheet cannot be used when encoding multiple files\n");
 		}
 		if(option_values.keep_foreign_metadata || option_values.keep_foreign_metadata_if_present) {
-			/* we're not going to try and support the re-creation of broken WAVE files */
-			if(option_values.ignore_chunk_sizes)
-				return usage_error("ERROR: using --keep-foreign-metadata cannot be used with --ignore-chunk-sizes\n");
 			if(option_values.test_only)
 				return usage_error("ERROR: --keep-foreign-metadata is not allowed in test mode\n");
 			if(option_values.analyze)
 				return usage_error("ERROR: --keep-foreign-metadata is not allowed in analyis mode\n");
 			flac__utils_printf(stderr, 2, "NOTE: --keep-foreign-metadata is a new feature; make sure to test the output file before deleting the original.\n");
+			if(option_values.ignore_chunk_sizes)
+				flac__utils_printf(stderr, 2, "NOTE: --ignore-chunk-sizes with --keep-foreign-metadata: chunk sizes will be recomputed from the decoded audio length\n");
 		}
 		if(0 != option_values.decode_chained_stream) {
 			if(0 != option_values.skip_specification)
@@ -565,10 +564,13 @@ int do_it(void)
 			if(option_values.num_files > 1)
 				option_values.cmdline_forced_outfilename = 0;
 			for(i = 0, retval = 0; i < option_values.num_files; i++) {
+				int r;
 				if(0 == strcmp(option_values.filenames[i], "-") && !first)
 					continue;
-				if(encode_file(option_values.filenames[i], first, i == (option_values.num_files-1)))
-					retval = 1;
+				r = encode_file(option_values.filenames[i], first, i == (option_values.num_files-1));
+				/* preserve the data-truncation exit code (2) unless a harder error (1) occurs */
+				if(r != 0)
+					retval = (retval == 1 || r == 1) ? 1 : r;
 				else
 					first = false;
 			}
