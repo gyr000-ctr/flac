@@ -52,6 +52,7 @@
 #include "decode.h"
 #include "encode.h"
 #include "local_string_utils.h" /* for flac__strlcat() and flac__strlcpy() */
+#include "pipe_spool.h"
 #include "utils.h"
 #include "vorbiscomment.h"
 
@@ -1468,6 +1469,18 @@ int encode_file(const char *infilename, FLAC__bool is_first_file, FLAC__bool is_
 	/* internal_outfilename is the file we will actually write to; it will be a temporary name if infilename==outfilename */
 	char *internal_outfilename = 0; /* NULL implies 'use outfilename' */
 	size_t infilename_length;
+	/*
+	 * --keep-foreign-metadata requires seekable input and output.  When a
+	 * pipe is involved, the pipe side is spooled to a bounded temporary
+	 * file (fixed-size transfer buffer, never whole-file buffering) and
+	 * the ordinary file-based code path is used, so the output is
+	 * byte-for-byte identical to a regular file-to-file encode.
+	 */
+	pipe_spool_t *fm_input_spool = 0;
+	pipe_spool_t *fm_output_spool = 0;
+	const char *fm_infilename = infilename;
+	const char *fm_outfilename;
+	FILE *fm_infile;
 
 	if(0 == outfilename) {
 		flac__utils_printf(stderr, 1, "ERROR: filename too long: %s", infilename);
@@ -1578,15 +1591,65 @@ int encode_file(const char *infilename, FLAC__bool is_first_file, FLAC__bool is_
 	}
 
 	if(option_values.keep_foreign_metadata || option_values.keep_foreign_metadata_if_present) {
-		if(encode_infile == stdin || option_values.force_to_stdout) {
-			conditional_fclose(encode_infile);
-			return usage_error("ERROR: --keep-foreign-metadata cannot be used when encoding from stdin or to stdout\n");
-		}
 		if(input_format != FORMAT_WAVE && input_format != FORMAT_WAVE64 && input_format != FORMAT_RF64 && input_format != FORMAT_AIFF && input_format != FORMAT_AIFF_C) {
 			conditional_fclose(encode_infile);
 			return usage_error("ERROR: --keep-foreign-metadata can only be used with WAVE, Wave64, RF64, or AIFF input\n");
 		}
+
+		/*
+		 * The foreign metadata state machine needs seekable input and
+		 * output.  Spool whichever side is a pipe to a bounded temporary
+		 * file and substitute it for the pipe below; the encode itself is
+		 * then indistinguishable from a regular file-to-file run.
+		 */
+		if(encode_infile == stdin) {
+			const char *spool_error = 0;
+			if(0 == (fm_input_spool = flac__pipe_spool_new(&spool_error))) {
+				flac__utils_printf(stderr, 1, "ERROR: cannot create temporary file for foreign metadata: %s\n", spool_error);
+				conditional_fclose(encode_infile);
+				return 1;
+			}
+			/* include the lookahead bytes already consumed for format detection */
+			if(!flac__pipe_spool_copy_from_stream_with_prefix(fm_input_spool, encode_infile, lookahead, lookahead_length, &spool_error)) {
+				flac__utils_printf(stderr, 1, "ERROR: spooling stdin failed: %s\n", spool_error);
+				flac__pipe_spool_delete(fm_input_spool);
+				conditional_fclose(encode_infile);
+				return 1;
+			}
+			if(!flac__pipe_spool_rewind(fm_input_spool, &spool_error)) {
+				flac__utils_printf(stderr, 1, "ERROR: %s\n", spool_error);
+				flac__pipe_spool_delete(fm_input_spool);
+				conditional_fclose(encode_infile);
+				return 1;
+			}
+			/*
+			 * The encoder still receives the first 'lookahead_length'
+			 * bytes through its lookahead argument, so position the spool
+			 * just past them to mimic the original stdin file offset.
+			 * Foreign-metadata scanning re-opens the spool by path and
+			 * seeks back to byte 0 itself.
+			 */
+			if(fseeko(fm_input_spool->file, (FLAC__off_t)lookahead_length, SEEK_SET) < 0) {
+				flac__utils_printf(stderr, 1, "ERROR: seek failed in temporary file\n");
+				flac__pipe_spool_delete(fm_input_spool);
+				conditional_fclose(encode_infile);
+				return 1;
+			}
+			infilesize = (FLAC__off_t)fm_input_spool->size;
+			fm_infilename = fm_input_spool->path;
+		}
+		if(option_values.force_to_stdout) {
+			const char *spool_error = 0;
+			if(0 == (fm_output_spool = flac__pipe_spool_new_for_output(&spool_error))) {
+				flac__utils_printf(stderr, 1, "ERROR: cannot create temporary file for foreign metadata: %s\n", spool_error);
+				flac__pipe_spool_delete(fm_input_spool);
+				conditional_fclose(encode_infile);
+				return 1;
+			}
+		}
 	}
+	fm_infile = fm_input_spool? fm_input_spool->file : encode_infile;
+	fm_outfilename = fm_output_spool? fm_output_spool->path : outfilename;
 
 	/*
 	 * Error if output file already exists (and -f not used).
@@ -1618,14 +1681,16 @@ int encode_file(const char *infilename, FLAC__bool is_first_file, FLAC__bool is_
 		else
 			flac__utils_printf(stderr, 1, "ERROR: output file %s already exists, use -f to override\n", outfilename);
 		conditional_fclose(encode_infile);
-		return 1;
+		retval = 1;
+		goto encode_file_cleanup;
 	}
 
 	if(option_values.format_input_size >= 0) {
 	   	if (input_format != FORMAT_RAW || infilesize >= 0) {
 			flac__utils_printf(stderr, 1, "ERROR: can only use --input-size when encoding raw samples from stdin\n");
 			conditional_fclose(encode_infile);
-			return 1;
+			retval = 1;
+			goto encode_file_cleanup;
 		}
 		else {
 			infilesize = option_values.format_input_size;
@@ -1658,12 +1723,14 @@ int encode_file(const char *infilename, FLAC__bool is_first_file, FLAC__bool is_
 
 	if(!flac__utils_parse_skip_until_specification(option_values.skip_specification, &encode_options.skip_specification) || encode_options.skip_specification.is_relative) {
 		conditional_fclose(encode_infile);
-		return usage_error("ERROR: invalid value for --skip\n");
+		retval = usage_error("ERROR: invalid value for --skip\n");
+		goto encode_file_cleanup;
 	}
 
 	if(!flac__utils_parse_skip_until_specification(option_values.until_specification, &encode_options.until_specification)) { /*@@@@ more checks: no + without --skip, no - unless known total_samples_to_{en,de}code */
 		conditional_fclose(encode_infile);
-		return usage_error("ERROR: invalid value for --until\n");
+		retval = usage_error("ERROR: invalid value for --until\n");
+		goto encode_file_cleanup;
 	}
 	/* if there is no "--until" we want to default to "--until=-0" */
 	if(0 == option_values.until_specification)
@@ -1721,7 +1788,8 @@ int encode_file(const char *infilename, FLAC__bool is_first_file, FLAC__bool is_
 		if((internal_outfilename = safe_malloc_(dest_len)) == NULL) {
 			flac__utils_printf(stderr, 1, "ERROR allocating memory for tempfile name\n");
 			conditional_fclose(encode_infile);
-			return 1;
+			retval = 1;
+			goto encode_file_cleanup;
 		}
 		flac_snprintf(internal_outfilename, dest_len, "%s%s", outfilename, tmp_suffix);
 	}
@@ -1733,10 +1801,10 @@ int encode_file(const char *infilename, FLAC__bool is_first_file, FLAC__bool is_
 		encode_options.format_options.raw.bps = option_values.format_bps;
 		encode_options.format_options.raw.sample_rate = option_values.format_sample_rate;
 
-		retval = flac__encode_file(encode_infile, infilesize, infilename, internal_outfilename? internal_outfilename : outfilename, lookahead, lookahead_length, encode_options);
+		retval = flac__encode_file(fm_infile, infilesize, fm_infilename, internal_outfilename? internal_outfilename : fm_outfilename, lookahead, lookahead_length, encode_options);
 	}
 	else if(input_format == FORMAT_FLAC || input_format == FORMAT_OGGFLAC) {
-		retval = flac__encode_file(encode_infile, infilesize, infilename, internal_outfilename? internal_outfilename : outfilename, lookahead, lookahead_length, encode_options);
+		retval = flac__encode_file(fm_infile, infilesize, fm_infilename, internal_outfilename? internal_outfilename : fm_outfilename, lookahead, lookahead_length, encode_options);
 	}
 	else if(input_format == FORMAT_WAVE || input_format == FORMAT_WAVE64 || input_format == FORMAT_RF64 || input_format == FORMAT_AIFF || input_format == FORMAT_AIFF_C) {
 		encode_options.format_options.iff.foreign_metadata = 0;
@@ -1756,11 +1824,20 @@ int encode_file(const char *infilename, FLAC__bool is_first_file, FLAC__bool is_
 				conditional_fclose(encode_infile);
 				if(internal_outfilename != 0)
 					free(internal_outfilename);
-				return 1;
+				retval = 1;
+				goto encode_file_cleanup;
 			}
 		}
 
-		retval = flac__encode_file(encode_infile, infilesize, infilename, internal_outfilename? internal_outfilename : outfilename, lookahead, lookahead_length, encode_options);
+		retval = flac__encode_file(fm_infile, infilesize, fm_infilename, internal_outfilename? internal_outfilename : fm_outfilename, lookahead, lookahead_length, encode_options);
+
+		/*
+		 * The encode session takes ownership of the input FILE* and closes
+		 * it.  An output spool is only ever referenced by path (the
+		 * encoder opens that name itself), so its handle stays ours.
+		 */
+		if(fm_input_spool)
+			flac__pipe_spool_detach_file(fm_input_spool);
 
 		if(encode_options.format_options.iff.foreign_metadata)
 			flac__foreign_metadata_delete(encode_options.format_options.iff.foreign_metadata);
@@ -1771,7 +1848,15 @@ int encode_file(const char *infilename, FLAC__bool is_first_file, FLAC__bool is_
 	}
 
 	if(retval == 0) {
-		if(strcmp(outfilename, "-")) {
+		if(fm_output_spool) {
+			/* the encode was spooled; stream the identical bytes to stdout */
+			const char *spool_error = 0;
+			if(!flac__pipe_spool_dump_to_stream(fm_output_spool, grabbag__file_get_binary_stdout(), &spool_error)) {
+				flac__utils_printf(stderr, 1, "ERROR: writing FLAC stream to stdout failed: %s\n", spool_error);
+				retval = 1;
+			}
+		}
+		else if(strcmp(outfilename, "-")) {
 			if(option_values.replay_gain) {
 				float title_gain, title_peak;
 				const char *error;
@@ -1816,6 +1901,10 @@ int encode_file(const char *infilename, FLAC__bool is_first_file, FLAC__bool is_
 	if(internal_outfilename != 0)
 		free(internal_outfilename);
 
+encode_file_cleanup:
+	flac__pipe_spool_delete(fm_output_spool);
+	flac__pipe_spool_delete(fm_input_spool);
+
 	return retval;
 }
 
@@ -1829,6 +1918,15 @@ int decode_file(const char *infilename)
 	foreign_metadata_t *foreign_metadata = 0;
 	const char *outfilename = get_outfilename(infilename, ".    "); /* Placeholder until we know what the actual suffix is */
 	size_t infilename_length;
+	/*
+	 * --keep-foreign-metadata needs seekable input and output.  When a
+	 * pipe is involved, spool that side to a bounded temporary file and
+	 * run the normal file-based decode, then stream the result to stdout.
+	 */
+	pipe_spool_t *fm_input_spool = 0;
+	pipe_spool_t *fm_output_spool = 0;
+	const char *fm_infilename = infilename;
+	const char *fm_outfilename;
 
 	if(0 == outfilename) {
 		flac__utils_printf(stderr, 1, "ERROR: filename too long: %s", infilename);
@@ -1837,22 +1935,55 @@ int decode_file(const char *infilename)
 
 	if(!option_values.analyze && !option_values.test_only &&(option_values.keep_foreign_metadata || option_values.keep_foreign_metadata_if_present)) {
 		const char *error;
-		if(0 == strcmp(infilename, "-") || 0 == strcmp(outfilename, "-"))
-			return usage_error("ERROR: --keep-foreign-metadata cannot be used when decoding from stdin or to stdout\n");
+		const FLAC__bool kfm_from_stdin = (0 == strcmp(infilename, "-"));
+		const FLAC__bool kfm_to_stdout = (0 == strcmp(outfilename, "-"));
 		if(output_format == FORMAT_RAW)
 			return usage_error("ERROR: --keep-foreign-metadata cannot be used with raw output\n");
+
+		/* spool the stdin FLAC stream so the foreign metadata iterator can seek */
+		if(kfm_from_stdin) {
+			if(0 == (fm_input_spool = flac__pipe_spool_new(&error))) {
+				flac__utils_printf(stderr, 1, "ERROR: cannot create temporary file for foreign metadata: %s\n", error);
+				return 1;
+			}
+			if(!flac__pipe_spool_copy_from_stream(fm_input_spool, grabbag__file_get_binary_stdin(), &error)) {
+				flac__utils_printf(stderr, 1, "ERROR: spooling stdin failed: %s\n", error);
+				flac__pipe_spool_delete(fm_input_spool);
+				return 1;
+			}
+			if(!flac__pipe_spool_rewind(fm_input_spool, &error)) {
+				flac__utils_printf(stderr, 1, "ERROR: %s\n", error);
+				flac__pipe_spool_delete(fm_input_spool);
+				return 1;
+			}
+			fm_infilename = fm_input_spool->path;
+		}
+		/* spool the decoded IFF output when writing to stdout */
+		if(kfm_to_stdout) {
+			if(0 == (fm_output_spool = flac__pipe_spool_new_for_output(&error))) {
+				flac__utils_printf(stderr, 1, "ERROR: cannot create temporary file for foreign metadata: %s\n", error);
+				flac__pipe_spool_delete(fm_input_spool);
+				return 1;
+			}
+		}
+		fm_outfilename = fm_output_spool? fm_output_spool->path : outfilename;
+
 		decode_options.format_options.iff.foreign_metadata = 0;
 		/* initialize foreign metadata structure */
 		foreign_metadata = flac__foreign_metadata_new(FOREIGN_BLOCK_TYPE__RIFF); /* RIFF is just a placeholder */
 		if(0 == foreign_metadata) {
 			flac__utils_printf(stderr, 1, "ERROR: creating foreign metadata object\n");
+			flac__pipe_spool_delete(fm_output_spool);
+			flac__pipe_spool_delete(fm_input_spool);
 			return 1;
 		}
-		if(!flac__foreign_metadata_read_from_flac(foreign_metadata, infilename, &error)) {
+		if(!flac__foreign_metadata_read_from_flac(foreign_metadata, fm_infilename, &error)) {
 			if(option_values.keep_foreign_metadata_if_present) {
 				flac__utils_printf(stderr, 1, "%s: WARNING reading foreign metadata: %s\n", infilename, error);
 				if(option_values.treat_warnings_as_errors) {
 					flac__foreign_metadata_delete(foreign_metadata);
+					flac__pipe_spool_delete(fm_output_spool);
+					flac__pipe_spool_delete(fm_input_spool);
 					return 1;
 				}
 				else {
@@ -1864,10 +1995,15 @@ int decode_file(const char *infilename)
 			else {
 				flac__utils_printf(stderr, 1, "%s: ERROR reading foreign metadata: %s\n", infilename, error);
 				flac__foreign_metadata_delete(foreign_metadata);
+				flac__pipe_spool_delete(fm_output_spool);
+				flac__pipe_spool_delete(fm_input_spool);
 				return 1;
 			}
 		}
 	}
+	/* when no foreign-metadata spooling happened, operate on the real paths */
+	if(0 == fm_output_spool)
+		fm_outfilename = outfilename;
 
 	if(option_values.force_raw_format)
 		output_format = FORMAT_RAW;
@@ -1940,14 +2076,20 @@ int decode_file(const char *infilename)
 	if(foreign_metadata != NULL) {
 		if((output_format != FORMAT_WAVE && output_format != FORMAT_RF64) && foreign_metadata->type == FOREIGN_BLOCK_TYPE__RIFF) {
 			flac__foreign_metadata_delete(foreign_metadata);
+			flac__pipe_spool_delete(fm_output_spool);
+			flac__pipe_spool_delete(fm_input_spool);
 			return usage_error("ERROR: foreign metadata type RIFF cannot be restored to a%s file, only to WAVE and RF64\n",FileFormatString[output_format]);
 		}
 		if((output_format != FORMAT_AIFF && output_format != FORMAT_AIFF_C) && foreign_metadata->type == FOREIGN_BLOCK_TYPE__AIFF) {
 			flac__foreign_metadata_delete(foreign_metadata);
+			flac__pipe_spool_delete(fm_output_spool);
+			flac__pipe_spool_delete(fm_input_spool);
 			return usage_error("ERROR: foreign metadata type AIFF cannot be restored to a%s file, only to AIFF and AIFF-C\n",FileFormatString[output_format]);
 		}
 		if(output_format != FORMAT_WAVE64 && foreign_metadata->type == FOREIGN_BLOCK_TYPE__WAVE64) {
 			flac__foreign_metadata_delete(foreign_metadata);
+			flac__pipe_spool_delete(fm_output_spool);
+			flac__pipe_spool_delete(fm_input_spool);
 			return usage_error("ERROR: foreign metadata type Wave64 cannot be restored to a%s file, only to Wave64\n",FileFormatString[output_format]);
 		}
 	}
@@ -1962,12 +2104,16 @@ int decode_file(const char *infilename)
 	if(!option_values.test_only && !option_values.force_file_overwrite && strcmp(outfilename, "-") && grabbag__file_get_filesize(outfilename) != (FLAC__off_t)(-1)) {
 		flac__utils_printf(stderr, 1, "ERROR: output file %s already exists, use -f to override\n", outfilename);
 		flac__foreign_metadata_delete(foreign_metadata);
+		flac__pipe_spool_delete(fm_output_spool);
+		flac__pipe_spool_delete(fm_input_spool);
 		return 1;
 	}
 
 	if(!option_values.test_only && !option_values.analyze) {
 		if(output_format == FORMAT_RAW && (option_values.format_is_big_endian < 0 || option_values.format_is_unsigned_samples < 0)) {
 			flac__foreign_metadata_delete(foreign_metadata);
+			flac__pipe_spool_delete(fm_output_spool);
+			flac__pipe_spool_delete(fm_input_spool);
 			return usage_error("ERROR: for decoding to a raw file you must specify a value for --endian and --sign\n");
 		}
 	}
@@ -1986,17 +2132,23 @@ int decode_file(const char *infilename)
 	if(treat_as_ogg) {
 		flac__utils_printf(stderr, 1, "%s: Ogg support has not been built into this copy of flac\n", infilename);
 		flac__foreign_metadata_delete(foreign_metadata);
+		flac__pipe_spool_delete(fm_output_spool);
+		flac__pipe_spool_delete(fm_input_spool);
 		return 1;
 	}
 #endif
 
 	if(!flac__utils_parse_skip_until_specification(option_values.skip_specification, &decode_options.skip_specification) || decode_options.skip_specification.is_relative) {
 		flac__foreign_metadata_delete(foreign_metadata);
+		flac__pipe_spool_delete(fm_output_spool);
+		flac__pipe_spool_delete(fm_input_spool);
 		return usage_error("ERROR: invalid value for --skip\n");
 	}
 
 	if(!flac__utils_parse_skip_until_specification(option_values.until_specification, &decode_options.until_specification)) { /*@@@ more checks: no + without --skip, no - unless known total_samples_to_{en,de}code */
 		flac__foreign_metadata_delete(foreign_metadata);
+		flac__pipe_spool_delete(fm_output_spool);
+		flac__pipe_spool_delete(fm_input_spool);
 		return usage_error("ERROR: invalid value for --until\n");
 	}
 	/* if there is no "--until" we want to default to "--until=-0" */
@@ -2006,6 +2158,8 @@ int decode_file(const char *infilename)
 	if(option_values.cue_specification) {
 		if(!flac__utils_parse_cue_specification(option_values.cue_specification, &decode_options.cue_specification)) {
 			flac__foreign_metadata_delete(foreign_metadata);
+			flac__pipe_spool_delete(fm_output_spool);
+			flac__pipe_spool_delete(fm_input_spool);
 			return usage_error("ERROR: invalid value for --cue\n");
 		}
 		decode_options.has_cue_specification = true;
@@ -2036,12 +2190,27 @@ int decode_file(const char *infilename)
 	else {
 		decode_options.format_options.iff.foreign_metadata = foreign_metadata;
 
-		retval = flac__decode_file(infilename, option_values.test_only? 0 : outfilename, option_values.analyze, option_values.aopts, decode_options);
+		retval = flac__decode_file(fm_infilename, option_values.test_only? 0 : fm_outfilename, option_values.analyze, option_values.aopts, decode_options);
 
 	}
 
+	/*
+	 * The decode session opens the spool paths itself and closes its own
+	 * handles; our spool FILE* handles are untouched and remain valid for
+	 * the dump below.
+	 */
+
 	if(foreign_metadata)
 		flac__foreign_metadata_delete(foreign_metadata);
+
+	if(retval == 0 && fm_output_spool) {
+		/* the decode was spooled; stream the identical bytes to stdout */
+		const char *spool_error = 0;
+		if(!flac__pipe_spool_dump_to_stream(fm_output_spool, grabbag__file_get_binary_stdout(), &spool_error)) {
+			flac__utils_printf(stderr, 1, "ERROR: writing decoded stream to stdout failed: %s\n", spool_error);
+			retval = 1;
+		}
+	}
 
 	if(retval == 0 && strcmp(infilename, "-")) {
 		if(option_values.preserve_modtime && strcmp(outfilename, "-"))
@@ -2049,6 +2218,9 @@ int decode_file(const char *infilename)
 		if(option_values.delete_input && !option_values.test_only && !option_values.analyze)
 			flac_unlink(infilename);
 	}
+
+	flac__pipe_spool_delete(fm_output_spool);
+	flac__pipe_spool_delete(fm_input_spool);
 
 	return retval;
 }

@@ -9,6 +9,7 @@ add_executable(flacapp
     foreign_metadata.c
     main.c
     local_string_utils.c
+    pipe_spool.c
     utils.c
     vorbiscomment.c
     version.rc

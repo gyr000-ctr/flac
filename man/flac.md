@@ -299,9 +299,16 @@ negated, see the **Negative options** section below.
 	metadata. If decoding, restore any saved non-audio chunks from FLAC
 	metadata when writing the decoded file. Foreign metadata cannot be
 	transcoded, e.g. WAVE chunks saved in a FLAC file cannot be restored
-	when decoding to AIFF. Input and output must be regular files (not
-	stdin or stdout). With this option, FLAC will pick the right output
-	format on decoding. It will exit with error if no such chunks are found.
+	when decoding to AIFF. With this option, FLAC will pick the right
+	output format on decoding. It will exit with error if no such chunks
+	are found.
+
+	Foreign metadata requires seeking, so when reading from stdin or
+	writing to stdout the data on the pipe side is first spooled to a
+	temporary file and the ordinary file-based processing is used; the
+	result written to stdout is byte-identical to a file-to-file run.
+	The transfer uses a fixed-size buffer, so memory use does not grow
+	with the size of the input.
 
 **\--keep-foreign-metadata-if-present**
 :	Like \--keep-foreign-metadata, but without throwing an error if

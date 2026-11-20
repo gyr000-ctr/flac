@@ -308,6 +308,25 @@ rt_test_autokf ()
 	rm -f rt.flac $3
 }
 
+# round-trip entirely through pipes (stdin/stdout) with foreign metadata;
+# the result must be byte-identical to the original input
+rt_test_pipe_kfm ()
+{
+	f="$1"
+	extra="$2"
+	echo $ECHO_N "pipe round-trip test ($f) encode... " $ECHO_C
+	run_flac --force --no-padding --lax -c $extra - < "$f" > rt_pipe.flac || die "ERROR"
+	echo $ECHO_N "decode... " $ECHO_C
+	run_flac --force --decode -c $extra - < rt_pipe.flac > rt_pipe.out || die "ERROR"
+	echo $ECHO_N "compare... " $ECHO_C
+	cmp "$f" rt_pipe.out || die "ERROR: file mismatch"
+	# the spooled encode must produce the same bytes as a regular file encode
+	run_flac --force --no-padding --lax -o rt_file.flac $extra "$f" || die "ERROR"
+	cmp rt_pipe.flac rt_file.flac || die "ERROR: pipe output differs from file output"
+	echo "OK"
+	rm -f rt_pipe.flac rt_pipe.out rt_file.flac
+}
+
 # assumes input file is WAVE; does not check the metadata-preserving features of flac-to-flac; that is checked later
 rt_test_flac ()
 {
@@ -1228,6 +1247,19 @@ rt_test_autokf "$testdatadir/AIFF-ID3.aiff" '--keep-foreign-metadata' 'rt.aiff'
 rt_test_autokf "$testdatadir/AIFF-C-sowt-tag.aifc" '--keep-foreign-metadata' 'rt.aifc'
 rt_test_autokf "$testdatadir/AIFF-C-sowt-compression-type-name.aifc" '--keep-foreign-metadata' 'rt.aifc'
 rt_test_autokf "$testdatadir/24bit-WaveFmtPCM.wav" '--keep-foreign-metadata' 'rt.wav'
+
+# --keep-foreign-metadata must also work through stdin/stdout pipes and
+# produce bytes identical to the regular file-based path
+echo "Testing --keep-foreign-metadata through pipes..."
+rt_test_pipe_kfm "$testdatadir/BWF-WaveFmtEx.wav" '--keep-foreign-metadata'
+rt_test_pipe_kfm "$testdatadir/AIFF-ID3.aiff" '--keep-foreign-metadata'
+rt_test_pipe_kfm "$testdatadir/AIFF-C-sowt-tag.aifc" '--keep-foreign-metadata'
+rt_test_pipe_kfm "$testdatadir/AIFF-C-sowt-compression-type-name.aifc" '--keep-foreign-metadata'
+rt_test_pipe_kfm "$testdatadir/24bit-WaveFmtPCM.wav" '--keep-foreign-metadata'
+rt_test_pipe_kfm "$testdatadir/BWF-WaveFmtEx.wav" '--keep-foreign-metadata-if-present'
+rt_test_pipe_kfm wacky1.wav '--keep-foreign-metadata'
+rt_test_pipe_kfm wacky1.w64 '--keep-foreign-metadata'
+rt_test_pipe_kfm wacky1.rf64 '--keep-foreign-metadata'
 
 ############################################################################
 # test the metadata-handling properties of flac-to-flac encoding
